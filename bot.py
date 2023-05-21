@@ -1,22 +1,27 @@
+import asyncio
 import logging
-import os
-import subprocess
 import sys
+from io import BytesIO
 from tempfile import NamedTemporaryFile
 
 import torch
 import vosk
-from dotenv import load_dotenv
-from telegram import Bot, Update
-from telegram.constants import MAX_FILESIZE_DOWNLOAD, MAX_MESSAGE_LENGTH
+from telegram import Message, Update
 from telegram.error import TelegramError
-from telegram.ext import CommandHandler, Filters, MessageHandler, Updater
-from telegram.ext.utils.types import CCT
+from telegram.ext import (Application, CommandHandler, ContextTypes,
+                          MessageHandler, filters)
 
-
-from exceptions import BigFileError
-
-load_dotenv()
+from constants import (AUDIO_CHANNELS, AUDIO_FORMAT, BIG_FILE_ERROR_TEXT,
+                       EMPTY_MESSAGE_ERROR_TEXT, EMPTY_TRANSCRIPT_ERROR_TEXT,
+                       ENHANCE_TEXT_LANGUAGE, GREET, LOG_CONVERTED,
+                       LOG_DOWNLOADED, LOG_ENHANCED, LOG_GREET, LOG_RECOGNIZED,
+                       LOG_TRANSCRIPT_SEND, MAX_FILESIZE_DOWNLOAD,
+                       MAX_TEXT_LENGTH, NONE_FILE_SIZE_ERROR_TEXT,
+                       NOT_VALID_FILETYPE_ERROR_TEXT, SAMPLE_RATE,
+                       TELEGRAM_TOKEN)
+from exceptions import (BigFileError, EmptyMessageError, EmptyTranscriptError,
+                        InvalidFiletypeError, NoneFileSizeError)
+from utils import send_error_message
 
 vosk.SetLogLevel(-1)
 
@@ -29,147 +34,165 @@ formatter = logging.Formatter(
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-AUDIO_CHANNELS = 1
-AUDIO_FORMAT = 's16le'
-SAMPLE_RATE = 16000
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-ENHANCE_TEXT_LANGUAGE = os.getenv(
-    'ENHANCE_TEXT_LANGUAGE', default='en')
 
-
-def greet(update: Update, context: CCT) -> None:
+async def greet(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
     """Send a welcome message."""
-    try:
-        if update.effective_chat:
-            context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=('Отправьте голосовое сообщение, видео или аудиофайл и'
-                      ' бот отправит Вам транскрипцию.'),
-                reply_to_message_id=update.message.message_id
-            )
-        else:
-            logger.error('Update object does not contain effective chat.'
-                         ' A welcome message not sent.')
-    except TelegramError as error:
-        logger.error(f'Telegram error while sending welcome message: {error}')
-    except Exception as error:
-        logger.exception(
-            f'Unexpected error while sending welcome message: {error}')
-        raise
-    else:
-        logger.debug('Bot sent a welcome message')
+
+    if update.message is None:
+        raise EmptyMessageError(EMPTY_MESSAGE_ERROR_TEXT)
+
+    await update.message.reply_text(GREET)
+
+    logger.debug(LOG_GREET)
 
 
-def download_file(update: Update, bot: Bot) -> bytes:
-    """Download file and save to temporary file."""
-    message_type = (update.message.voice or update.message.video_note
-                    or update.message.audio or update.message.document
-                    or update.message.video)
-    if message_type.file_size > MAX_FILESIZE_DOWNLOAD:
-        bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=('К сожалению, Telegram разрешает ботам скачивать'
-                  ' только файлы размером менее'
-                  f' {MAX_FILESIZE_DOWNLOAD} байт.'),
-            reply_to_message_id=update.message.message_id
-        )
-        raise BigFileError(
-            'The file is larger than MAX_FILESIZE_DOWNLOAD')
-    with NamedTemporaryFile() as tmpfile:
-        message_type.get_file().download(out=tmpfile)
-        logger.debug('File downloaded to memory')
-        tmpfile.seek(0)
-        return tmpfile.read()
+async def download_file(message: Message) -> bytes:
+    """Download file and return it."""
+
+    file_type = (
+        message.voice
+        or message.video_note
+        or message.audio
+        or message.document
+        or message.video
+    )
+
+    if file_type is None:
+        await send_error_message(message, NOT_VALID_FILETYPE_ERROR_TEXT)
+        raise InvalidFiletypeError(NOT_VALID_FILETYPE_ERROR_TEXT)
+
+    if file_type.file_size is None:
+        await send_error_message(message, NONE_FILE_SIZE_ERROR_TEXT)
+        raise NoneFileSizeError(NONE_FILE_SIZE_ERROR_TEXT)
+
+    if file_type.file_size > MAX_FILESIZE_DOWNLOAD:
+        await send_error_message(message, BIG_FILE_ERROR_TEXT)
+        raise BigFileError(BIG_FILE_ERROR_TEXT)
+
+    with BytesIO() as bytefile_from_user:
+        file_obj = await file_type.get_file()
+        await file_obj.download_to_memory(bytefile_from_user)
+        logger.debug(LOG_DOWNLOADED)
+        bytefile_from_user.seek(0)
+        return bytefile_from_user.read()
 
 
-def convert_file(input_file: bytes) -> bytes:
+async def convert_file(bytefile_from_user: bytes) -> bytes:
     """Convert file to valid format and save to temporary file."""
-    with NamedTemporaryFile() as tmpfile_out:
-        try:
-            subprocess.run(
-                (
-                    'ffmpeg',
-                    '-loglevel', 'quiet',
-                    '-y',
-                    '-i', '-',
-                    '-ac', str(AUDIO_CHANNELS),
-                    '-f', AUDIO_FORMAT,
-                    '-ar', str(SAMPLE_RATE),
-                    tmpfile_out.name
-                ),
-                input=input_file,
-                check=True
-            )
-            logger.debug('File converted to valid format')
-        except subprocess.CalledProcessError as error:
-            logger.exception(f'Error converting file: {error}')
-            raise
+
+    with NamedTemporaryFile() as tmpfile_in, \
+         NamedTemporaryFile() as tmpfile_out:
+        tmpfile_in.write(bytefile_from_user)
+        process = await asyncio.create_subprocess_exec(
+            'ffmpeg',
+            '-loglevel', 'quiet',
+            '-y',
+            '-i', tmpfile_in.name,
+            '-ac', str(AUDIO_CHANNELS),
+            '-f', AUDIO_FORMAT,
+            '-ar', str(SAMPLE_RATE),
+            tmpfile_out.name,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await process.wait()
+
+        logger.debug(LOG_CONVERTED)
+
         return tmpfile_out.read()
 
 
-def recognize_speech(speech: bytes) -> str:
+async def recognize_speech(speech: bytes) -> str:
     """Recognize text from audio using Vosk."""
+
     model = vosk.Model(model_path='models/vosk')
     recognizer = vosk.KaldiRecognizer(model, SAMPLE_RATE)
     recognizer.AcceptWaveform(speech)
-    logger.debug('Recognition complete')
+    logger.debug(LOG_RECOGNIZED)
     return recognizer.FinalResult()[14:-3]
 
 
-def enhance_transcript(transcript: str) -> str:
+async def enhance_transcript(transcript: str) -> str:
     """Enhance recognized text using a Silero model."""
+
     te_model = torch.package.PackageImporter(
         file_or_buffer='models/silero/v2_4lang_q.pt'
     ).load_pickle(package='te_model', resource='model')
-    logger.debug('Transcript enhancement complete')
+    logger.debug(LOG_ENHANCED)
     return te_model.enhance_text(transcript, ENHANCE_TEXT_LANGUAGE)
 
 
-def send_transcript(transcript: str, update: Update, bot: Bot) -> None:
+async def send_transcript(
+    message: Message,
+    transcript: str
+) -> None:
     """Send transcript in chunks to Telegram chat."""
-    for chunk_start in range(0, len(transcript), MAX_MESSAGE_LENGTH):
-        bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=transcript[chunk_start:chunk_start+MAX_MESSAGE_LENGTH],
-            reply_to_message_id=update.message.message_id
+
+    for chunk_start in range(0, len(transcript), MAX_TEXT_LENGTH):
+        await message.reply_text(
+            transcript[chunk_start:chunk_start+MAX_TEXT_LENGTH]
         )
 
 
-def transcribe(update: Update, context: CCT) -> None:
+async def transcribe(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
     """Convert and recognize file, enhance and send transcript."""
+
+    if update.message is None:
+        raise EmptyMessageError(EMPTY_MESSAGE_ERROR_TEXT)
+
+    transcript = await recognize_speech(
+        await convert_file(
+            await download_file(update.message)))
+
+    if not transcript:
+        logger.error(EMPTY_TRANSCRIPT_ERROR_TEXT)
+        send_error_message(update.message, EMPTY_TRANSCRIPT_ERROR_TEXT)
+        raise EmptyTranscriptError(EMPTY_TRANSCRIPT_ERROR_TEXT)
+
+    transcript = await enhance_transcript(transcript)
+
+    await send_transcript(update.message, transcript)
+
+    logger.debug(LOG_TRANSCRIPT_SEND)
+
+
+def main() -> None:
     try:
-        transcript = recognize_speech(
-            convert_file(download_file(update, context.bot)))
-        if not transcript:
-            logger.warning('Transcript is empty, nothing recognized')
-            transcript = 'Не удалось ничего распознать'
-        else:
-            transcript = enhance_transcript(transcript)
-        send_transcript(transcript, update, context.bot)
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+        application.add_handler(CommandHandler('start', greet))
+
+        application.add_handler(
+            MessageHandler(
+                filters.VOICE | filters.Document.AUDIO | filters.AUDIO |
+                filters.VIDEO_NOTE | filters.Document.VIDEO | filters.VIDEO,
+                transcribe
+            )
+        )
+
+        application.run_polling()
+
     except TelegramError as error:
         logger.error(f'Failed to send a message to Telegram: {error}')
+
+    except (
+        BigFileError,
+        EmptyMessageError,
+        EmptyTranscriptError,
+        InvalidFiletypeError,
+        NoneFileSizeError
+    ) as error:
+        logger.error(str(error))
+
     except Exception as error:
-        logger.error(error)
-    else:
-        logger.debug('Bot sent transcript')
+        logger.exception(f'Unexpected error: {error}')
 
 
 if __name__ == '__main__':
-    try:
-        updater = Updater(token=TELEGRAM_TOKEN)
-        updater.dispatcher.add_handler(
-            CommandHandler('start', greet, run_async=True))
-        updater.dispatcher.add_handler(
-            MessageHandler(
-                Filters.voice | Filters.document.audio | Filters.audio |
-                Filters.video_note | Filters.document.video | Filters.video,
-                transcribe,
-                run_async=True
-            )
-        )
-        updater.start_polling()
-        updater.idle()
-    except TelegramError as error:
-        logger.error(f'Failed to send a message to Telegram: {error}')
-    except Exception as error:
-        logger.error(error)
+    main()
